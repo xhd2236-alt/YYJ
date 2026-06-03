@@ -1,60 +1,64 @@
-tag:
-description: 'Release tag to announce (test mode)'
-required: true
-        default: 'v0.2.1'
-        default: 'v0.2.2'
+name: Discord Bundle Publisher
 
-permissions:
-contents: read
-@@ -33,7 +33,7 @@ jobs:
-         name=$(echo "$json" | jq -r '.name // .tagName')
-         url=$(echo  "$json" | jq -r '.url')
-         body=$(echo "$json" | jq -r '.body')
-          zip_name=$(echo "$json" | jq -r '.assets[]? | select(.name | endswith(".zip")) | .name' | head -n1)
-          exe_name=$(echo "$json" | jq -r '.assets[]? | select(.name | endswith(".exe")) | .name' | head -n1)
+on:
+  release:
+    types: [published]
 
-         if [ "${#body}" -gt 4000 ]; then
-           body="${body:0:3990}…（已截斷，完整內容請點 release 連結）"
-@@ -43,30 +43,37 @@ jobs:
-           echo "name=$name"
-           echo "url=$url"
-           echo "tag=$tag"
-            echo "zip_name=$zip_name"
-            echo "exe_name=$exe_name"
-           echo "body<<RELEASE_BODY_EOF"
-           echo "$body"
-           echo "RELEASE_BODY_EOF"
-         } >> "$GITHUB_OUTPUT"
+jobs:
+  discord-share:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Download release zip
-        if: ${{ steps.rel.outputs.zip_name != '' }}
-      - name: Bundle exe + license.key into zip
-        id: bundle
-        if: ${{ steps.rel.outputs.exe_name != '' }}
-env:
-GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          LICENSE_KEY: ${{ secrets.LICENSE_KEY }}
-run: |
-         mkdir -p _release
-         gh release download "${{ steps.rel.outputs.tag }}" \
-           --repo "${{ github.repository }}" \
-            --pattern "${{ steps.rel.outputs.zip_name }}" \
-            --pattern "${{ steps.rel.outputs.exe_name }}" \
-           --dir _release
-          printf '%s' "$LICENSE_KEY" > _release/license.key
-          exe_name="${{ steps.rel.outputs.exe_name }}"
-          zip_name="${exe_name%.exe}.zip"
-          (cd _release && zip "$zip_name" "$exe_name" license.key)
-          echo "zip_name=$zip_name" >> "$GITHUB_OUTPUT"
+      - name: Download .exe from GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Fetching release asset URL..."
+          # Uses the GitHub CLI to download all assets (or specific .exe) from the triggering release
+          gh release download ${{ github.event.release.tag_name }} --pattern "*.exe" --dir ./dist
+          
+          # Verify the file exists
+          if [ ! -d "./dist" ] || [ -z "$(ls -A ./dist)" ]; then
+            echo "Error: No .exe asset found in the release."
+            exit 1
+          fi
 
-     - name: Send Discord embed (with attached zip)
-env:
-WEBHOOK:  ${{ secrets.DISCORD_WEBHOOK_URL }}
-NAME:     ${{ steps.rel.outputs.name }}
-URL:      ${{ steps.rel.outputs.url }}
-BODY:     ${{ steps.rel.outputs.body }}
-          ZIP_NAME: ${{ steps.rel.outputs.zip_name }}
-          ZIP_NAME: ${{ steps.bundle.outputs.zip_name }}
-run: |
-         payload=$(jq -n \
-           --arg title "$NAME" \
+      - name: Materialize License Key
+        env:
+          LICENSE_KEY_DATA: ${{ secrets.LICENSE_KEY }}
+        run: |
+          # Create the bundle staging area
+          mkdir -p ./bundle
+          
+          # Move the downloaded exe into the bundle folder
+          mv ./dist/*.exe ./bundle/
+          
+          # Write the secret to license.key inside the bundle folder
+          echo "$LICENSE_KEY_DATA" > ./bundle/license.key
+          echo "Successfully materialized license.key."
+
+      - name: Create Zip Archive
+        run: |
+          cd bundle
+          zip -r ../app-with-license.zip ./*
+          cd ..
+          echo "Bundle zipped successfully."
+
+      - name: Post Bundle to Discord
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK" ]; then
+            echo "Error: DISCORD_WEBHOOK secret is missing."
+            exit 1
+          fi
+          
+          # Construct a clean notification message
+          MESSAGE="🚀 **New Release Bundle Available!**\n\n**Version:** \`${{ github.event.release.tag_name }}\`\n**Release Notes:** ${{ github.event.release.html_url }}\n\n*Download the attached ZIP file below for the fully authorized runnable bundle (includes executable and your personal license key).*"
+          
+          # Send the ZIP file to Discord using curl (multipart/form-data)
+          curl -F "payload_json={\"content\": \"$MESSAGE\"}" \
+               -F "file=@app-with-license.zip" \
+               $DISCORD_WEBHOOK
